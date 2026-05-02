@@ -16,7 +16,7 @@ class Encoder(nn.Module):
         H = args.image_size // 4
         W = args.image_size // 4
 
-        depths = [2, 2, 2]
+        depths = [2, 2, 20]
         heads  = [3, 6, 12]
         ws     = [8, 4, 2]
 
@@ -113,7 +113,7 @@ class Decoder(nn.Module):
 
         dim = dim_start * 2               # 8C
 
-        depths = [2, 2, 2]
+        depths = [20, 2, 2]
         heads  = [12, 6, 3]
         window_sizes = [2, 4, 8]
 
