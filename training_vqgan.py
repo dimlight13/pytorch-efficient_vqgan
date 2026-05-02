@@ -174,7 +174,7 @@ if __name__ == '__main__':
     parser.add_argument('--learning-rate', type=float, default=4.5e-6)
     parser.add_argument('--beta1', type=float, default=0.5)
     parser.add_argument('--beta2', type=float, default=0.9)
-    parser.add_argument('--disc-start', type=int, default=25000)
+    parser.add_argument('--disc-start', type=int, default=50000)
     parser.add_argument('--disc-factor', type=float, default=1.0)
     parser.add_argument('--rec-loss-factor', type=float, default=1.0)
     parser.add_argument('--perceptual-loss-factor', type=float, default=1.5)
