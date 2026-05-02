@@ -161,7 +161,7 @@ class TrainEfficientVQGAN:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="VQGAN on ImageNet")
-    parser.add_argument('--latent-dim', type=int, default=1024)
+    parser.add_argument('--latent-dim', type=int, default=256)
     parser.add_argument('--image-size', type=int, default=256)
     parser.add_argument('--num-codebook-vectors', type=int, default=1024)
     parser.add_argument('--beta', type=float, default=0.25)
