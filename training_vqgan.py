@@ -106,7 +106,7 @@ class TrainEfficientVQGAN:
 
                 # Reconstruction + Perceptual
                 perceptual_loss = self.perceptual_loss(imgs, decoded_images)
-                rec_loss = torch.abs(imgs - decoded_images)
+                rec_loss = (imgs - decoded_images) ** 2
 
                 nll_loss = (args.rec_loss_factor * rec_loss + 
                            args.perceptual_loss_factor * perceptual_loss)
