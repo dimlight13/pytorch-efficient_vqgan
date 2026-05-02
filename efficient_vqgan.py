@@ -18,7 +18,7 @@ class Encoder(nn.Module):
 
         depths = [2, 2, 20]
         heads  = [3, 6, 12]
-        ws     = [8, 4, 2]
+        ws     = [8, 8, 8]
 
         self.stages = nn.ModuleList()
         dim = C
@@ -115,7 +115,7 @@ class Decoder(nn.Module):
 
         depths = [20, 2, 2]
         heads  = [12, 6, 3]
-        window_sizes = [2, 4, 8]
+        window_sizes = [8, 8, 8]
 
         self.upsample_blocks = nn.ModuleList()
         for i in range(3):
