@@ -168,29 +168,15 @@ class Decoder(nn.Module):
         x = self.to_rgb(x)                 # (B, 3, H, W)
         return x
 
-class CodebookEMA(nn.Module):
-    def __init__(self, args, decay=0.99, eps=1e-5, update=True):
+class Codebook(nn.Module):
+    def __init__(self, args):
         super().__init__()
         self.K = args.num_codebook_vectors
         self.D = args.latent_dim
         self.beta = args.beta
-        self.decay, self.eps = decay, eps
-        self.update = update
 
         self.embedding = nn.Embedding(self.K, self.D)
         nn.init.uniform_(self.embedding.weight, -1 / self.K, 1 / self.K)
-        self.embedding.weight.requires_grad = False
-
-        self.register_buffer("cluster_size", torch.zeros(self.K))
-        self.register_buffer("embed_avg", torch.zeros(self.K, self.D))
-        self._ema_inited = False
-
-    @torch.no_grad()
-    def _maybe_init_ema_from_embedding(self):
-        if not self._ema_inited:
-            self.cluster_size.fill_(1.0)
-            self.embed_avg.copy_(self.embedding.weight.data)
-            self._ema_inited = True
 
     @torch.no_grad()
     def _assign_indices(self, flat: torch.Tensor):
@@ -206,29 +192,14 @@ class CodebookEMA(nn.Module):
         z_nhwc = z.permute(0, 2, 3, 1).contiguous()
         flat = z_nhwc.view(-1, self.D)
 
-        self._maybe_init_ema_from_embedding()
-
         with torch.no_grad():
             idx = self._assign_indices(flat)  # (N,)
 
         z_q = self.embedding(idx).view_as(z_nhwc)
 
-        if self.training and self.update:
-            with torch.no_grad():
-                counts = torch.bincount(idx, minlength=self.K).to(self.cluster_size.dtype)  # (K,)
-                embed_sum = torch.zeros_like(self.embed_avg)                                # (K,D)
-                embed_sum.index_add_(0, idx, flat)
-
-                self.cluster_size.mul_(self.decay).add_(counts, alpha=1 - self.decay)
-                self.embed_avg.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
-
-                n = self.cluster_size.sum()
-                smoothed = (self.cluster_size + self.eps) / (n + self.K * self.eps) * n     # (K,)
-                embed_mean = self.embed_avg / smoothed.unsqueeze(1)                         # (K,D)
-                self.embedding.weight.data.copy_(embed_mean)
-
-        # commitment loss (EMA VQ 관례)
-        loss = self.beta * F.mse_loss(z_nhwc, z_q.detach())
+        codebook_loss = F.mse_loss(z_q, z_nhwc.detach())
+        commitment_loss = self.beta * F.mse_loss(z_nhwc, z_q.detach())
+        loss = codebook_loss + commitment_loss
 
         # straight-through
         z_q = z_nhwc + (z_q - z_nhwc).detach()
@@ -242,7 +213,7 @@ class EfficientVQGAN(nn.Module):
         super().__init__()
         self.encoder=Encoder(args)
         self.decoder=Decoder(args)
-        self.codebook=CodebookEMA(args)
+        self.codebook=Codebook(args)
 
         self.quant_conv = nn.Conv2d(self.encoder.out_dim, args.latent_dim, kernel_size=1)
         self.post_quant_conv = nn.Conv2d(args.latent_dim, args.latent_dim, kernel_size=1)
