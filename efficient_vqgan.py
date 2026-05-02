@@ -279,7 +279,7 @@ class EfficientVQGAN(nn.Module):
 
         λ = torch.norm(perceptual_loss_grads) / (torch.norm(gan_loss_grads) + 1e-4)
         λ = torch.clamp(λ, 0, 1e4).detach()
-        return 0.8 * λ
+        return λ
 
     def load_checkpoint(self, path):
         self.load_state_dict(torch.load(path))
