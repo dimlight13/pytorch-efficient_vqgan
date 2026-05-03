@@ -107,11 +107,11 @@ class Decoder(nn.Module):
         W = args.image_size // 16
 
         self.residual_block = ResidualBlock(
-            dim_in=dim_start, dim_out=dim_start * 2, hw=(H, W),
+            dim_in=dim_start, dim_out=dim_start, hw=(H, W),
             resi_connection='3conv'
         )
 
-        dim = dim_start * 2               # 8C
+        dim = dim_start                   # 4C
 
         depths = [20, 2, 2]
         heads  = [12, 6, 3]
@@ -138,9 +138,10 @@ class Decoder(nn.Module):
             dim = dim // 2
             H, W = H * 2, W * 2
 
+        final_dim = dim
         self.final_feat_up = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='nearest'),   # H/2 -> H
-            nn.Conv2d(C, C, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(final_dim, C, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(inplace=True),
             nn.Conv2d(C, C, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(inplace=True)
@@ -153,7 +154,7 @@ class Decoder(nn.Module):
 
         x = z.flatten(2).transpose(1, 2)   # (B, HW, D)
         x = self.in_proj(x)                # (B, HW, 4C)
-        x = self.residual_block(x, H, W)         # (B, HW, 8C)
+        x = self.residual_block(x, H, W)         # (B, HW, 4C)
 
         curH, curW = H, W                  # H/16, W/16
 
@@ -180,7 +181,8 @@ class Codebook(nn.Module):
 
     @torch.no_grad()
     def _assign_indices(self, flat: torch.Tensor):
-        w = self.embedding.weight
+        flat = flat.float()
+        w = self.embedding.weight.float()
         x2 = (flat ** 2).sum(1, keepdim=True)        # (N,1)
         w2 = (w ** 2).sum(1)                          # (K,)
         dist = x2 + w2.unsqueeze(0) - 2 * flat @ w.t()# (N,K)
@@ -197,8 +199,8 @@ class Codebook(nn.Module):
 
         z_q = self.embedding(idx).view_as(z_nhwc)
 
-        codebook_loss = F.mse_loss(z_q, z_nhwc.detach())
-        commitment_loss = self.beta * F.mse_loss(z_nhwc, z_q.detach())
+        codebook_loss = F.mse_loss(z_q.float(), z_nhwc.detach().float())
+        commitment_loss = self.beta * F.mse_loss(z_nhwc.float(), z_q.detach().float())
         loss = codebook_loss + commitment_loss
 
         # straight-through

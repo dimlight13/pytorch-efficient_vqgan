@@ -13,14 +13,21 @@ from pg_modules.discriminator import ProjectedDiscriminator as Discriminator
 
 class TrainEfficientVQGAN:
     def __init__(self, args):
+        if args.device.startswith("cuda"):
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+
         self.vqgan = EfficientVQGAN(args).to(device=args.device)
         self.discriminator = Discriminator(diffaug=True, interp224=False).to(device=args.device)
 
         for p in self.discriminator.feature_network.parameters():
             p.requires_grad = False
+        self.discriminator_params = list(self.discriminator.discriminator.parameters())
         self.discriminator.discriminator.apply(weights_init)
         self.discriminator.train()
-        self.perceptual_loss = LPIPS().eval().to(device=args.device)
+        self.perceptual_loss = LPIPS(use_dropout=False).eval().to(device=args.device)
 
         self.loaded_param_names = set()
         if args.checkpoint_path and os.path.exists(args.checkpoint_path):
@@ -37,6 +44,19 @@ class TrainEfficientVQGAN:
         else:
             print("No checkpoint found or checkpoint path not specified. Starting from scratch.")
 
+        if args.device.startswith("cuda"):
+            self.vqgan.to(memory_format=torch.channels_last)
+            self.discriminator.to(memory_format=torch.channels_last)
+            self.perceptual_loss.to(memory_format=torch.channels_last)
+
+        self.use_amp = args.device.startswith("cuda")
+        self.amp_device_type = "cuda" if self.use_amp else "cpu"
+        self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
+        self.scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=self.use_amp and self.amp_dtype == torch.float16,
+        )
+
         self.opt_vq, self.opt_disc = self.configure_optimizers(args)
 
         self.prepare_training()
@@ -44,6 +64,13 @@ class TrainEfficientVQGAN:
 
     def configure_optimizers(self, args):
         lr = args.learning_rate
+        adam_kwargs = {
+            "lr": lr,
+            "eps": 1e-08,
+            "betas": (args.beta1, args.beta2),
+        }
+        if args.device.startswith("cuda"):
+            adam_kwargs["fused"] = True
 
         group_loaded, group_new = [], []
         for n, p in self.vqgan.named_parameters():
@@ -63,24 +90,32 @@ class TrainEfficientVQGAN:
                 list(self.vqgan.post_quant_conv.parameters())
             )
 
-            opt_vq = torch.optim.Adam(params, lr=lr, eps=1e-08, betas=(args.beta1, args.beta2))
+            opt_vq = torch.optim.Adam(params, **adam_kwargs)
         else:
             opt_vq = torch.optim.Adam(
                 [
                     {"params": group_loaded, "lr": lr * 0.2},
                     {"params": group_new,    "lr": lr},
                 ],
-                lr=lr, eps=1e-08, betas=(args.beta1, args.beta2)
+                **adam_kwargs
             )
 
         opt_disc = torch.optim.Adam(
-            self.discriminator.discriminator.parameters(), lr=lr, eps=1e-08, betas=(args.beta1, args.beta2))
+            self.discriminator_params, **adam_kwargs)
         return opt_vq, opt_disc
 
     @staticmethod
     def prepare_training():
         os.makedirs("results", exist_ok=True)
         os.makedirs("checkpoints", exist_ok=True)
+
+    @staticmethod
+    def resize_for_perceptual(imgs, decoded_images, size):
+        if size <= 0 or imgs.shape[-2:] == (size, size):
+            return imgs, decoded_images
+        imgs_lpips = F.interpolate(imgs, size=(size, size), mode="bilinear", align_corners=False, antialias=True)
+        decoded_lpips = F.interpolate(decoded_images, size=(size, size), mode="bilinear", align_corners=False, antialias=True)
+        return imgs_lpips, decoded_lpips
 
     def train(self, args):
         os.makedirs("results", exist_ok=True)
@@ -93,62 +128,96 @@ class TrainEfficientVQGAN:
         for epoch in range(args.epochs):
             for i, (imgs, _) in enumerate(tqdm(train_loader)):
 
-                imgs = imgs.to(device=args.device)
+                imgs = imgs.to(
+                    device=args.device,
+                    non_blocking=args.device.startswith("cuda"),
+                    memory_format=torch.channels_last,
+                )
                 global_step = epoch * steps_per_epoch + i
 
-                decoded_images, _, q_loss = self.vqgan(imgs)
+                with torch.amp.autocast(
+                    device_type=self.amp_device_type,
+                    dtype=self.amp_dtype,
+                    enabled=self.use_amp,
+                ):
+                    decoded_images, _, q_loss = self.vqgan(imgs)
 
-                # Reconstruction + Perceptual
-                perceptual_loss = self.perceptual_loss(imgs, decoded_images)
-                rec_loss = (imgs - decoded_images) ** 2
+                    # Reconstruction + Perceptual
+                    use_perceptual = args.perceptual_loss_factor > 0 and (
+                        args.perceptual_every <= 1 or global_step % args.perceptual_every == 0
+                    )
+                    if use_perceptual:
+                        imgs_lpips, decoded_lpips = self.resize_for_perceptual(
+                            imgs, decoded_images, args.perceptual_image_size
+                        )
+                        perceptual_loss = self.perceptual_loss(imgs_lpips, decoded_lpips)
+                    else:
+                        perceptual_loss = decoded_images.new_zeros(())
+                    rec_loss = (imgs - decoded_images) ** 2
 
-                nll_loss = (args.rec_loss_factor * rec_loss + 
-                           args.perceptual_loss_factor * perceptual_loss)
-                nll_loss = nll_loss.mean()
+                    nll_loss = (args.rec_loss_factor * rec_loss +
+                               args.perceptual_loss_factor * perceptual_loss)
+                    nll_loss = nll_loss.mean()
 
-                disc_factor = self.vqgan.adopt_weight(args.disc_factor, global_step, threshold=args.disc_start)
-                disc_active = disc_factor > 0
+                    disc_factor = self.vqgan.adopt_weight(args.disc_factor, global_step, threshold=args.disc_start)
+                    disc_active = disc_factor > 0
 
-                vq_loss = (
-                    nll_loss
-                    + q_loss.mean()
-                )
+                    vq_loss = (
+                        nll_loss
+                        + q_loss.mean()
+                    )
 
-                if disc_active:
-                    for p in self.discriminator.discriminator.parameters():
-                        p.requires_grad = False
+                    if disc_active:
+                        for p in self.discriminator_params:
+                            p.requires_grad = False
 
-                    disc_fake_for_g = self.discriminator(decoded_images, None)
-                    g_loss = -torch.mean(disc_fake_for_g)
+                        disc_fake_for_g = self.discriminator(decoded_images, None)
+                        g_loss = -torch.mean(disc_fake_for_g)
 
-                    try:
-                        d_weight = self.vqgan.calculate_lambda(nll_loss, g_loss)
-                    except RuntimeError:
-                        d_weight = torch.tensor(0.0, device=args.device)
+                        try:
+                            d_weight = self.vqgan.calculate_lambda(nll_loss, g_loss)
+                        except RuntimeError:
+                            d_weight = torch.tensor(0.0, device=args.device)
 
-                    vq_loss = vq_loss + d_weight * disc_factor * g_loss
+                        vq_loss = vq_loss + d_weight * disc_factor * g_loss
 
-                    for p in self.discriminator.discriminator.parameters():
-                        p.requires_grad = True
+                        for p in self.discriminator_params:
+                            p.requires_grad = True
 
                 # Backward
                 self.opt_vq.zero_grad(set_to_none=True)
-                vq_loss.backward()
-                self.opt_vq.step()
+                if self.scaler.is_enabled():
+                    self.scaler.scale(vq_loss).backward()
+                    self.scaler.step(self.opt_vq)
+                else:
+                    vq_loss.backward()
+                    self.opt_vq.step()
 
                 if disc_active:
                     # =============================
                     # Discriminator (hinge loss)
                     # =============================
-                    disc_fake_for_d = self.discriminator(decoded_images.detach(), None)
-                    disc_real = self.discriminator(imgs.detach(), None)
-                    d_loss_real = torch.mean(F.relu(1. - disc_real))
-                    d_loss_fake = torch.mean(F.relu(1. + disc_fake_for_d))
-                    gan_loss = disc_factor * 0.5 * (d_loss_real + d_loss_fake)
+                    with torch.amp.autocast(
+                        device_type=self.amp_device_type,
+                        dtype=self.amp_dtype,
+                        enabled=self.use_amp,
+                    ):
+                        disc_fake_for_d = self.discriminator(decoded_images.detach(), None)
+                        disc_real = self.discriminator(imgs.detach(), None)
+                        d_loss_real = torch.mean(F.relu(1. - disc_real))
+                        d_loss_fake = torch.mean(F.relu(1. + disc_fake_for_d))
+                        gan_loss = disc_factor * 0.5 * (d_loss_real + d_loss_fake)
 
                     self.opt_disc.zero_grad(set_to_none=True)
-                    gan_loss.backward()
-                    self.opt_disc.step()
+                    if self.scaler.is_enabled():
+                        self.scaler.scale(gan_loss).backward()
+                        self.scaler.step(self.opt_disc)
+                    else:
+                        gan_loss.backward()
+                        self.opt_disc.step()
+
+                if self.scaler.is_enabled():
+                    self.scaler.update()
 
                 if i % 1000 == 0:
                     with torch.no_grad():
@@ -169,7 +238,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-codebook-vectors', type=int, default=1024)
     parser.add_argument('--beta', type=float, default=0.25)
     parser.add_argument('--image-channels', type=int, default=3)
-    parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset name (imagenet or cifar10)')
+    parser.add_argument('--dataset', type=str, default='imagenet', help='Dataset name (imagenet or cifar10)')
     parser.add_argument('--dataset-path', type=str, default='./data', help='ImageNet dataset root path')
     parser.add_argument('--device', type=str, default="cuda")
     parser.add_argument('--batch-size', type=int, default=16)
@@ -180,7 +249,11 @@ if __name__ == '__main__':
     parser.add_argument('--disc-start', type=int, default=50000)
     parser.add_argument('--disc-factor', type=float, default=1.0)
     parser.add_argument('--rec-loss-factor', type=float, default=1.0)
-    parser.add_argument('--perceptual-loss-factor', type=float, default=1.5)
+    parser.add_argument('--perceptual-loss-factor', type=float, default=1.0)
+    parser.add_argument('--perceptual-image-size', type=int, default=128,
+                        help='LPIPS input size; set 0 to use full training resolution')
+    parser.add_argument('--perceptual-every', type=int, default=1,
+                        help='Compute LPIPS every N steps; 1 keeps the perceptual loss active every step')
     parser.add_argument('--freeze-codebook-steps', type=int, default=1000,
                         help='deactivate codebook EMA until the freeze step')
     parser.add_argument('--codebook-update-interval', type=int, default=1,

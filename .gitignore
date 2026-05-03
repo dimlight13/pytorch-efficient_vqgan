@@ -4,3 +4,5 @@ data/
 results/
 vgg_lpips/
 reconstruction_results/
+.gitignore
+.vscode

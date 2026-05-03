@@ -163,6 +163,7 @@ class LPIPS(nn.Module):
         self.load_from_pretrained()
         for param in self.parameters():
             param.requires_grad = False
+        self.lins = (self.lin0, self.lin1, self.lin2, self.lin3, self.lin4)
 
     def load_from_pretrained(self, name="vgg_lpips"):
         ckpt = get_ckpt_path(name, "taming/modules/autoencoder/lpips")
@@ -179,18 +180,23 @@ class LPIPS(nn.Module):
         return model
 
     def forward(self, input, target):
-        in0_input, in1_input = (self.scaling_layer(input), self.scaling_layer(target))
-        outs0, outs1 = self.net(in0_input), self.net(in1_input)
-        feats0, feats1, diffs = {}, {}, {}
-        lins = [self.lin0, self.lin1, self.lin2, self.lin3, self.lin4]
-        for kk in range(len(self.chns)):
-            feats0[kk], feats1[kk] = normalize_tensor(outs0[kk]), normalize_tensor(outs1[kk])
-            diffs[kk] = (feats0[kk] - feats1[kk]) ** 2
+        in0_input = self.scaling_layer(input)
+        in1_input = self.scaling_layer(target)
 
-        res = [spatial_average(lins[kk].model(diffs[kk]), keepdim=True) for kk in range(len(self.chns))]
-        val = res[0]
-        for l in range(1, len(self.chns)):
-            val += res[l]
+        if input.requires_grad:
+            outs0 = self.net(in0_input)
+        else:
+            with torch.no_grad():
+                outs0 = self.net(in0_input)
+        outs1 = self.net(in1_input)
+
+        val = None
+        for kk, lin in enumerate(self.lins):
+            feat0 = normalize_tensor(outs0[kk])
+            feat1 = normalize_tensor(outs1[kk])
+            diff = (feat0 - feat1) ** 2
+            term = spatial_average(lin.model(diff), keepdim=True)
+            val = term if val is None else val + term
         return val
 
 
