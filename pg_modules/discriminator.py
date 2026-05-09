@@ -151,12 +151,14 @@ class ProjectedDiscriminator(torch.nn.Module):
     def __init__(
         self,
         diffaug=True,
+        diffaug_policy='color,translation,cutout',
         interp224=True,
         backbone_kwargs={},
         **kwargs
     ):
         super().__init__()
         self.diffaug = diffaug
+        self.diffaug_policy = diffaug_policy
         self.interp224 = interp224
         self.feature_network = F_RandomProj(**backbone_kwargs)
         self.discriminator = MultiScaleD(
@@ -175,7 +177,7 @@ class ProjectedDiscriminator(torch.nn.Module):
 
     def forward(self, x, c):
         if self.diffaug:
-            x = DiffAugment(x, policy='color,translation,cutout')
+            x = DiffAugment(x, policy=self.diffaug_policy)
 
         if self.interp224:
             x = F.interpolate(x, 224, mode='bilinear', align_corners=False)

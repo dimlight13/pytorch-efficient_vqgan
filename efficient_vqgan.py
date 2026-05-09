@@ -4,14 +4,48 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from swin_transformer_module.swin_transformer import SwinTransformerBlock as SwinBlock, PatchMerging, PatchExpanding, PatchEmbed, PatchUnEmbed
-from typing import Optional
 from typing import Optional, Tuple
+
+
+class HybridPatchStem(nn.Module):
+    def __init__(self, in_chans: int, embed_dim: int):
+        super().__init__()
+        hidden = max(32, embed_dim // 2)
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_chans, hidden, kernel_size=3, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(hidden, embed_dim, kernel_size=3, stride=2, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+class FeatureResBlock(nn.Module):
+    def __init__(self, channels: int, hidden: Optional[int] = None, init_scale: float = 0.1):
+        super().__init__()
+        hidden = hidden or channels
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, hidden, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(hidden, channels, 3, padding=1),
+        )
+        self.res_scale = nn.Parameter(torch.tensor(float(init_scale)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.res_scale * self.block(x)
 
 class Encoder(nn.Module):
     def __init__(self, args):
         super().__init__()
         C = 64                              # base C after patch partition
-        self.patch_embed = nn.Conv2d(args.image_channels, C, 4, 4)
+        stem_type = getattr(args, "encoder_stem", "hybrid")
+        if stem_type == "patch4":
+            self.patch_embed = nn.Conv2d(args.image_channels, C, 4, 4)
+        elif stem_type == "hybrid":
+            self.patch_embed = HybridPatchStem(args.image_channels, C)
+        else:
+            raise ValueError("encoder_stem must be 'hybrid' or 'patch4'")
         self.patch_norm = nn.LayerNorm(C)
 
         H = args.image_size // 4
@@ -20,6 +54,7 @@ class Encoder(nn.Module):
         depths = [2, 6, 12]
         heads  = [2, 4, 8]                  # head_dim = 32 throughout
         ws     = [8, 8, 8]
+        use_fused_window = getattr(args, "fused_window_process", True)
 
         self.stages = nn.ModuleList()
         dim = C
@@ -28,7 +63,8 @@ class Encoder(nn.Module):
             blocks = nn.ModuleList()
             for j in range(depths[i]):
                 shift = (ws_eff // 2) if (j % 2 == 1 and ws_eff > 1) else 0
-                blocks.append(SwinBlock(dim, (H, W), heads[i], ws_eff, shift))
+                blocks.append(SwinBlock(dim, (H, W), heads[i], ws_eff, shift,
+                                        fused_window_process=use_fused_window))
 
             merge = PatchMerging((H, W), dim) if i < 2 else None
             self.stages.append(nn.ModuleDict({"blocks": blocks, "merge": merge}))
@@ -40,6 +76,10 @@ class Encoder(nn.Module):
         self.out_dim = dim
         self.final_H = H
         self.final_W = W
+        pre_quant_blocks = max(0, int(getattr(args, "encoder_pre_quant_blocks", 1)))
+        self.pre_quant = nn.Sequential(
+            *[FeatureResBlock(dim, init_scale=0.1) for _ in range(pre_quant_blocks)]
+        )
 
     def forward(self, x):
         x = self.patch_embed(x)                       # (B,C,H/4,W/4)
@@ -57,6 +97,7 @@ class Encoder(nn.Module):
                 curW //= 2
 
         x = x.transpose(1, 2).contiguous().view(B, self.out_dim, curH, curW)
+        x = self.pre_quant(x)
         return x
 
 class ResidualBlock(nn.Module):
@@ -100,7 +141,7 @@ class ResidualBlock(nn.Module):
 
 
 class DecoderRefineBlock(nn.Module):
-    def __init__(self, channels: int, bottleneck_ratio: int = 4):
+    def __init__(self, channels: int, bottleneck_ratio: int = 4, init_scale: float = 0.05):
         super().__init__()
         hidden = max(16, channels // bottleneck_ratio)
         self.block = nn.Sequential(
@@ -110,7 +151,7 @@ class DecoderRefineBlock(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(hidden, channels, 1),
         )
-        self.res_scale = nn.Parameter(torch.tensor(0.0))
+        self.res_scale = nn.Parameter(torch.tensor(float(init_scale)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.res_scale * self.block(x)
@@ -136,6 +177,8 @@ class Decoder(nn.Module):
         depths = [12, 6, 2]
         heads  = [8, 4, 2]                # head_dim = 32 throughout
         window_sizes = [8, 8, 8]
+        use_fused_window = getattr(args, "fused_window_process", True)
+        min_upsample_channels = max(1, int(getattr(args, "decoder_min_upsample_channels", C)))
 
         self.upsample_blocks = nn.ModuleList()
         for i in range(3):
@@ -145,21 +188,23 @@ class Decoder(nn.Module):
             for j in range(depths[i]):
                 shift = (ws_eff // 2) if (j % 2 == 1 and ws_eff > 1) else 0
                 swin_blocks.append(
-                    SwinBlock(dim, (H, W), heads[i], ws_eff, shift)
+                    SwinBlock(dim, (H, W), heads[i], ws_eff, shift,
+                              fused_window_process=use_fused_window)
                 )
 
-            patch_expanding = PatchExpanding(dim)   # 채널 1/2, 해상도 ×2
+            next_dim = max(dim // 2, min_upsample_channels)
+            patch_expanding = PatchExpanding(dim, out_dim=next_dim)   # 해상도 ×2
 
             self.upsample_blocks.append(nn.ModuleDict({
                 "swin_blocks": swin_blocks,
                 "patch_expanding": patch_expanding
             }))
 
-            dim = dim // 2
+            dim = next_dim
             H, W = H * 2, W * 2
 
-        final_dim = dim                              # = C/2 (32 with C=64)
-        wide = 2 * C                                 # 128
+        final_dim = dim
+        wide = max(2 * C, final_dim * 2)
         self.final_feat_up = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(final_dim, wide, kernel_size=3, stride=1, padding=1),
@@ -167,8 +212,11 @@ class Decoder(nn.Module):
             nn.Conv2d(wide, wide, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(inplace=True),
         )
-        refine_blocks = max(0, int(getattr(args, "decoder_refine_blocks", 1)))
-        self.refine = nn.Sequential(*[DecoderRefineBlock(wide) for _ in range(refine_blocks)])
+        refine_blocks = max(0, int(getattr(args, "decoder_refine_blocks", 2)))
+        refine_init = float(getattr(args, "decoder_refine_init", 0.05))
+        self.refine = nn.Sequential(*[
+            DecoderRefineBlock(wide, init_scale=refine_init) for _ in range(refine_blocks)
+        ])
 
         self.to_rgb = nn.Conv2d(wide, args.image_channels, 3, padding=1)
 
@@ -204,12 +252,16 @@ class Codebook(nn.Module):
         self.ema_decay = getattr(args, "codebook_ema_decay", 0.99)
         self.eps = getattr(args, "codebook_eps", 1e-5)
         self.dead_code_threshold = getattr(args, "dead_code_threshold", 1.0)
+        self.lookup_chunk_size = int(getattr(args, "codebook_lookup_chunk_size", 8192))
 
         self.embedding = nn.Embedding(self.K, self.D)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=self.D ** -0.5)
         self.embedding.weight.requires_grad_(False)
         self.register_buffer("ema_cluster_size", torch.ones(self.K))
         self.register_buffer("ema_w", self.embedding.weight.detach().clone())
+        self.register_buffer("_pending_cluster_size", torch.zeros(self.K), persistent=False)
+        self.register_buffer("_pending_embed_sum", torch.zeros(self.K, self.D), persistent=False)
+        self._pending_ema_batches = 0
 
     def _codebook_update_enabled(self, global_step: Optional[int]):
         if global_step is None:
@@ -222,15 +274,25 @@ class Codebook(nn.Module):
     def _assign_indices(self, flat: torch.Tensor):
         flat = flat.float()
         w = self.embedding.weight.float()
-        x2 = (flat ** 2).sum(1, keepdim=True)        # (N,1)
         w2 = (w ** 2).sum(1)                          # (K,)
-        dist = x2 + w2.unsqueeze(0) - 2 * flat @ w.t()# (N,K)
-        return torch.argmin(dist, dim=1)              # (N,)
+        chunk_size = self.lookup_chunk_size
+        if chunk_size <= 0 or flat.shape[0] <= chunk_size:
+            x2 = (flat ** 2).sum(1, keepdim=True)        # (N,1)
+            dist = x2 + w2.unsqueeze(0) - 2 * flat @ w.t()# (N,K)
+            return torch.argmin(dist, dim=1)              # (N,)
+
+        indices = []
+        for flat_chunk in flat.split(chunk_size, dim=0):
+            x2 = (flat_chunk ** 2).sum(1, keepdim=True)
+            dist = x2 + w2.unsqueeze(0) - 2 * flat_chunk @ w.t()
+            indices.append(torch.argmin(dist, dim=1))
+        return torch.cat(indices, dim=0)
 
     @torch.no_grad()
     def sync_ema_buffers(self):
         self.ema_cluster_size.fill_(1.0)
         self.ema_w.copy_(self.embedding.weight.detach())
+        self.clear_pending_ema_update()
 
     @torch.no_grad()
     def reset_dead_codes(self, perturb_std: float = 0.01):
@@ -255,13 +317,24 @@ class Codebook(nn.Module):
         return n_dead
 
     @torch.no_grad()
-    def _ema_update(self, flat: torch.Tensor, idx: torch.Tensor):
+    def clear_pending_ema_update(self):
+        self._pending_cluster_size.zero_()
+        self._pending_embed_sum.zero_()
+        self._pending_ema_batches = 0
+
+    @torch.no_grad()
+    def _ema_stats(self, flat: torch.Tensor, idx: torch.Tensor):
         flat = flat.float()
         cluster_size = flat.new_zeros(self.K)
         cluster_size.index_add_(0, idx, flat.new_ones(idx.shape[0]))
         embed_sum = flat.new_zeros(self.K, self.D)
         embed_sum.index_add_(0, idx, flat)
+        return cluster_size, embed_sum
 
+    @torch.no_grad()
+    def _apply_ema_stats(self, cluster_size: torch.Tensor, embed_sum: torch.Tensor):
+        cluster_size = cluster_size.to(device=self.ema_cluster_size.device, dtype=self.ema_cluster_size.dtype)
+        embed_sum = embed_sum.to(device=self.ema_w.device, dtype=self.ema_w.dtype)
         self.ema_cluster_size.mul_(self.ema_decay).add_(cluster_size, alpha=1 - self.ema_decay)
         self.ema_w.mul_(self.ema_decay).add_(embed_sum, alpha=1 - self.ema_decay)
 
@@ -274,7 +347,27 @@ class Codebook(nn.Module):
         embedding = self.ema_w / cluster_size.unsqueeze(1)
         self.embedding.weight.copy_(embedding.to(self.embedding.weight.dtype))
 
-    def forward(self, z: torch.Tensor, global_step: Optional[int] = None):
+    @torch.no_grad()
+    def _ema_update(self, flat: torch.Tensor, idx: torch.Tensor):
+        cluster_size, embed_sum = self._ema_stats(flat, idx)
+        self._apply_ema_stats(cluster_size, embed_sum)
+
+    @torch.no_grad()
+    def queue_ema_update(self, flat: torch.Tensor, idx: torch.Tensor):
+        cluster_size, embed_sum = self._ema_stats(flat, idx)
+        self._pending_cluster_size.add_(cluster_size.to(self._pending_cluster_size.dtype))
+        self._pending_embed_sum.add_(embed_sum.to(self._pending_embed_sum.dtype))
+        self._pending_ema_batches += 1
+
+    @torch.no_grad()
+    def flush_pending_ema_update(self):
+        if self._pending_ema_batches == 0:
+            return False
+        self._apply_ema_stats(self._pending_cluster_size, self._pending_embed_sum)
+        self.clear_pending_ema_update()
+        return True
+
+    def forward(self, z: torch.Tensor, global_step: Optional[int] = None, defer_update: bool = False):
         # (B,C,H,W) → (N,D)
         B, C, H, W = z.shape
         z_nhwc = z.permute(0, 2, 3, 1).contiguous()
@@ -286,7 +379,10 @@ class Codebook(nn.Module):
         z_q = self.embedding(idx).view_as(z_nhwc)
 
         if self.training and self._codebook_update_enabled(global_step):
-            self._ema_update(flat.detach(), idx)
+            if defer_update:
+                self.queue_ema_update(flat.detach(), idx)
+            else:
+                self._ema_update(flat.detach(), idx)
 
         commitment_loss = self.beta * F.mse_loss(z_nhwc.float(), z_q.detach().float())
         loss = commitment_loss
@@ -309,9 +405,9 @@ class EfficientVQGAN(nn.Module):
         self.post_quant_conv = nn.Conv2d(args.latent_dim, args.latent_dim, kernel_size=1)
         self.last_layer = self.decoder.to_rgb
 
-    def forward(self, imgs, global_step: Optional[int] = None):
+    def forward(self, imgs, global_step: Optional[int] = None, defer_codebook_update: bool = False):
         z=self.encoder(imgs); zq=self.quant_conv(z)
-        zq,idx,qloss=self.codebook(zq, global_step=global_step)
+        zq,idx,qloss=self.codebook(zq, global_step=global_step, defer_update=defer_codebook_update)
         zq=self.post_quant_conv(zq)
         rec=self.decoder(zq)
         return rec,idx,qloss
@@ -337,14 +433,16 @@ class EfficientVQGAN(nn.Module):
         progress = min(1.0, float(step - threshold + 1) / float(rampup_steps))
         return value + (disc_factor - value) * progress
 
-    def calculate_lambda(self, perceptual_loss, gan_loss):
+    def calculate_lambda(self, perceptual_loss, gan_loss, max_weight: float = 100.0):
         last_layer = self.decoder.to_rgb
         last_layer_weight = last_layer.weight
         perceptual_loss_grads = torch.autograd.grad(perceptual_loss, last_layer_weight, retain_graph=True)[0]
         gan_loss_grads = torch.autograd.grad(gan_loss, last_layer_weight, retain_graph=True)[0]
 
         λ = torch.norm(perceptual_loss_grads) / (torch.norm(gan_loss_grads) + 1e-4)
-        λ = torch.clamp(λ, 0, 1e4).detach()
+        if max_weight is not None and max_weight > 0:
+            λ = torch.clamp(λ, 0, max_weight)
+        λ = λ.detach()
         return λ
 
     def load_checkpoint(self, path):

@@ -4,7 +4,7 @@ import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import os, sys
 from torch.nn import functional as F
-from kernels.window_process.window_process import WindowProcess, WindowProcessReverse
+from kernels.window_process.window_process import HAS_NATIVE_WINDOW_PROCESS, WindowProcess, WindowProcessReverse
 
 kernel_path = os.path.abspath(os.path.join('..'))
 sys.path.append(kernel_path)
@@ -71,6 +71,7 @@ class WindowAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.use_sdpa = hasattr(F, "scaled_dot_product_attention")
 
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
@@ -80,25 +81,47 @@ class WindowAttention(nn.Module):
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
 
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
+        if self.use_sdpa:
+            relative_position_bias = relative_position_bias.to(dtype=q.dtype, device=q.device)
+            if mask is not None:
+                nW = mask.shape[0]
+                attn_mask = (
+                    relative_position_bias.unsqueeze(0).unsqueeze(0)
+                    + mask.to(dtype=q.dtype, device=q.device).unsqueeze(0).unsqueeze(2)
+                )
+                attn_mask = attn_mask.expand(B_ // nW, -1, -1, -1, -1).reshape(B_, self.num_heads, N, N)
+            else:
+                attn_mask = relative_position_bias.unsqueeze(0)
+
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                scale=self.scale,
+            )
         else:
-            attn = self.softmax(attn)
+            q = q * self.scale
+            attn = (q @ k.transpose(-2, -1))
+            attn = attn + relative_position_bias.unsqueeze(0)
 
-        attn = self.attn_drop(attn)
+            if mask is not None:
+                nW = mask.shape[0]
+                attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+                attn = attn.view(-1, self.num_heads, N, N)
+                attn = self.softmax(attn)
+            else:
+                attn = self.softmax(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+            attn = self.attn_drop(attn)
+            x = attn @ v
+
+        x = x.transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -167,7 +190,7 @@ class SwinTransformerBlock(nn.Module):
             attn_mask = None
 
         self.register_buffer("attn_mask", attn_mask)
-        self.fused_window_process = fused_window_process
+        self.fused_window_process = fused_window_process and HAS_NATIVE_WINDOW_PROCESS
 
     def forward(self, x):
         H, W = self.input_resolution
@@ -237,14 +260,22 @@ class SwinTransformerBlock(nn.Module):
 
 
 class PatchExpanding(nn.Module):
-    def __init__(self, dim: int, r: int = 2, kernel_size: int = 3, norm_layer: nn.Module = nn.LayerNorm):
+    def __init__(
+        self,
+        dim: int,
+        r: int = 2,
+        kernel_size: int = 3,
+        norm_layer: nn.Module = nn.LayerNorm,
+        out_dim: int = None,
+    ):
         super().__init__()
         assert r == 2
         assert dim % 2 == 0
 
         self.dim = dim
         self.r = r
-        self.out_c = dim // 2
+        self.out_c = int(out_dim) if out_dim is not None else dim // 2
+        assert self.out_c > 0
 
         pad = kernel_size // 2
         self.conv = nn.Conv2d(dim, (r * r) * self.out_c, kernel_size, stride=1, padding=pad, bias=True)
@@ -256,13 +287,13 @@ class PatchExpanding(nn.Module):
     def forward(self, x: torch.Tensor, H: int, W: int):
         """
         x: (B, H*W, C)
-        return: x_up (B, 4*H*W, C//2), H*2, W*2
+        return: x_up (B, 4*H*W, out_c), H*2, W*2
         """
         B, L, C = x.shape
         assert L == H * W and C == self.dim, f"Got (L={L},C={C}) but expected (H*W={H*W}, C={self.dim})"
 
         x = x.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()  # (B,C,H,W)
-        x = self.conv(x)  # (B, 4*C', H, W)  where C' = C//2
+        x = self.conv(x)  # (B, 4*out_c, H, W)
         x = self.ps(x)
 
         H2, W2 = H * self.r, W * self.r

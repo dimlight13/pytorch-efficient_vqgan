@@ -6,3 +6,4 @@ pip install autopep8 pylint gdown ipykernel
 pip install timm
 pip install matplotlib
 pip install albumentations
+# pip install -r requirements.txt

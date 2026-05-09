@@ -59,12 +59,8 @@ class ImagePaths(Dataset):
 
 
 def load_data(args):
-    """
-    Adaptive data loader that switches between datasets based on args.dataset
-    Supported datasets: 'imagenet', 'cifar10'
-    """
-    # Get dataset name from args (default to 'cifar10' if not specified)
     dataset_name = getattr(args, 'dataset', 'cifar10').lower()
+    num_workers = getattr(args, 'num_workers', 8)
     
     if dataset_name == 'imagenet':
         # ImageNet configuration
@@ -107,9 +103,11 @@ def load_data(args):
         train_data,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=args.device.startswith("cuda"),
-        drop_last=True
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
+        drop_last=True,
     )
     
     return train_loader

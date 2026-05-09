@@ -33,8 +33,8 @@ def save_reconstruction(original, reconstructed, save_path):
     print(f"Saved reconstruction to {save_path}")
 
 
-def reconstruct_single_image(model, image_path, save_path, device):
-    image = load_image(image_path, image_size=model.decoder.to_rgb.in_channels * 64)
+def reconstruct_single_image(model, image_path, save_path, device, image_size=256):
+    image = load_image(image_path, image_size=image_size)
 
     image = image.to(device)
     with torch.no_grad():
@@ -168,7 +168,7 @@ def main(args):
     elif args.input_image:
         print(f"Processing single image: {args.input_image}")
         output_path = args.output_path or "reconstruction_result.png"
-        reconstruct_single_image(model, args.input_image, output_path, device)
+        reconstruct_single_image(model, args.input_image, output_path, device, args.image_size)
     elif args.input_dir:
         output_dir = args.output_dir or "reconstruction_results"
         reconstruct_from_directory(
@@ -183,9 +183,33 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="VQGAN Reconstruction Inference")
     parser.add_argument('--image-size', type=int, default=256, help='Image resolution')
     parser.add_argument('--image-channels', type=int, default=3, help='Number of image channels')
-    parser.add_argument('--num-codebook-vectors', type=int, default=1024, help='Number of codebook vectors')
-    parser.add_argument('--latent-dim', type=int, default=1024, help='Latent dimension')
+    parser.add_argument('--num-codebook-vectors', type=int, default=4096, help='Number of codebook vectors')
+    parser.add_argument('--latent-dim', type=int, default=256, help='Latent dimension')
     parser.add_argument('--beta', type=float, default=0.25, help='Commitment loss weight')
+    parser.add_argument('--encoder-stem', type=str, default='hybrid', choices=['hybrid', 'patch4'],
+                        help='Encoder input stem')
+    parser.add_argument('--encoder-pre-quant-blocks', type=int, default=1,
+                        help='Residual conv blocks before quant_conv')
+    parser.add_argument('--decoder-min-upsample-channels', type=int, default=64,
+                        help='Minimum channel count kept after decoder PatchExpanding stages')
+    parser.add_argument('--decoder-refine-blocks', type=int, default=2,
+                        help='Number of full-resolution decoder refinement blocks')
+    parser.add_argument('--decoder-refine-init', type=float, default=0.05,
+                        help='Initial residual scale for decoder refinement blocks')
+    parser.add_argument('--freeze-codebook-steps', type=int, default=5000,
+                        help='Disable codebook EMA updates before this global step')
+    parser.add_argument('--codebook-update-interval', type=int, default=1,
+                        help='Update codebook EMA every N steps after freeze-codebook-steps')
+    parser.add_argument('--codebook-ema-decay', type=float, default=0.99,
+                        help='EMA decay for codebook embeddings')
+    parser.add_argument('--codebook-eps', type=float, default=1e-5,
+                        help='Numerical epsilon for EMA codebook normalization')
+    parser.add_argument('--codebook-lookup-chunk-size', type=int, default=8192,
+                        help='Chunk size for nearest-code lookup')
+    parser.add_argument('--dead-code-threshold', type=float, default=0.1,
+                        help='EMA cluster size below which a code is considered dead')
+    parser.add_argument('--fused-window-process', action='store_true', default=True,
+                        help='Use native fused Swin window processing when available')
     parser.add_argument('--checkpoint-path', type=str, default="checkpoints/conv3_last.pt",
                         help='Path to pretrained VQGAN checkpoint')
     parser.add_argument('--input-image', type=str, default=None,
