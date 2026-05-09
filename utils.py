@@ -320,6 +320,12 @@ def flexible_load_pretrained(model: torch.nn.Module, ckpt_path: str,
 
     merged = {**dst_sd, **{k: v for k, v in mapped.items() if k in dst_sd and dst_sd[k].shape == v.shape}}
     incompatible = model.load_state_dict(merged, strict=False)
+    if hasattr(model, "codebook") and hasattr(model.codebook, "sync_ema_buffers"):
+        ema_keys = {"codebook.ema_cluster_size", "codebook.ema_w"}
+        if not ema_keys.issubset(mapped.keys()):
+            model.codebook.sync_ema_buffers()
+            if verbose:
+                print("[FlexibleLoad] Synced missing codebook EMA buffers from embedding weights")
     if verbose:
         print(f"[FlexibleLoad] loaded tensors: {len(mapped)}")
         if hasattr(incompatible, "missing_keys") and incompatible.missing_keys:
